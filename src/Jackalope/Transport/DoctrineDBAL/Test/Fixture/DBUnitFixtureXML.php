@@ -1,6 +1,8 @@
 <?php
 namespace Jackalope\Transport\DoctrineDBAL\Test\Fixture;
 
+use PHPCR\PropertyType;
+
 /**
  * Convert Jackalope Document or System Views into PHPUnit DBUnit Fixture XML files.
  *
@@ -165,14 +167,17 @@ class DBUnitFixtureXML extends XMLDocument
 
     public function addForeignKeys()
     {
-        // make sure we have table phpcr_nodes_foreignkeys even if there is not a single entry in it to have it truncated
-        $this->ensureTableExists('phpcr_nodes_foreignkeys', array('source_id', 'source_property_name', 'target_id', 'type'));
+        // make sure we have the references even if there is not a single entry in it to have it truncated
+        $this->ensureTableExists('phpcr_nodes_references', array('source_id', 'source_property_name', 'target_id'));
+        $this->ensureTableExists('phpcr_nodes_weakreferences', array('source_id', 'source_property_name', 'target_id'));
 
         // delay this to the end to not add entries for weak refs to not existing nodes
         foreach($this->foreignKeys as $uuid => $foreignKey) {
             if (isset($this->ids[$uuid])) {
                 foreach($foreignKey as $data) {
-                    $this->addRow('phpcr_nodes_foreignkeys', $data);
+                    $table = PropertyType::WEAKREFERENCE === $data['type'] ? 'phpcr_nodes_weakreferences' : 'phpcr_nodes_references';
+                    unset($data['type']);
+                    $this->addRow($table, $data);
                 }
             }
         }

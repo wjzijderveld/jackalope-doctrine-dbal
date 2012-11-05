@@ -125,6 +125,14 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
     /**
      * @var array
      */
+    private $tables = array(
+        PropertyType::REFERENCE => 'phpcr_nodes_references',
+        PropertyType::WEAKREFERENCE => 'phpcr_nodes_weakreferences',
+    );
+
+    /**
+     * @var array
+     */
     private $referencesToDelete = array();
 
     /**
@@ -571,8 +579,10 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
     private function syncForeignKeys()
     {
         if ($this->referencesToUpdate) {
-            $query = 'DELETE FROM phpcr_nodes_foreignkeys WHERE source_id IN (?)';
-            $this->conn->executeUpdate($query, array(array_keys($this->referencesToUpdate)), array(Connection::PARAM_INT_ARRAY));
+            foreach ($this->tables as $table) {
+                $query = "DELETE FROM $table WHERE source_id IN (?)";
+                $this->conn->executeUpdate($query, array(array_keys($this->referencesToUpdate)), array(Connection::PARAM_INT_ARRAY));
+            }
 
             foreach ($this->referencesToUpdate as $nodeId => $references) {
                 foreach ($references['properties'] as $name => $data) {
@@ -584,10 +594,10 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
                                 'source_id' => $nodeId,
                                 'source_property_name' => $name,
                                 'target_id' => $targetId,
-                                'type' => $data['type'],
                             );
 
-                            $this->conn->insert('phpcr_nodes_foreignkeys', $params);
+                            $table = PropertyType::WEAKREFERENCE == $data['type'] ? $this->tables[PropertyType::WEAKREFERENCE] : $this->tables[PropertyType::REFERENCE];
+                            $this->conn->insert($table, $params);
                         } catch (ItemNotFoundException $e) {
                             if (PropertyType::REFERENCE == $data['type']) {
                                 throw new ReferentialIntegrityException(
@@ -600,19 +610,18 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
             }
         }
 
+        // TODO on RDBMS that support deferred FKs we could skip this step
         if ($this->referencesToDelete) {
-            $nodeIds = array_keys($this->referencesToDelete);
-            $params = array(PropertyType::REFERENCE, $nodeIds);
+            $params = array(array_keys($this->referencesToDelete));
 
             // due to the outer join we cannot filter on workspace_name, but this is ok
             // since within a transaction there can ever be missing referenced nodes within the current workspace
-            $query = 'SELECT fk.target_id
-            FROM phpcr_nodes_foreignkeys fk
-                LEFT OUTER JOIN phpcr_nodes n ON fk.target_id = n.id
-            WHERE fk.type = ?
-              AND fk.target_id IN (?)';
+            $query = 'SELECT r.target_id
+            FROM phpcr_nodes_references r
+                LEFT OUTER JOIN phpcr_nodes n ON r.target_id = n.id
+            WHERE r.target_id IN (?)';
 
-            $stmt = $this->conn->executeQuery($query, $params, array(\PDO::PARAM_INT, Connection::PARAM_INT_ARRAY));
+            $stmt = $this->conn->executeQuery($query, $params, array(Connection::PARAM_INT_ARRAY));
             $missingTargets = $stmt->fetchAll(\PDO::FETCH_COLUMN);
             if ($missingTargets) {
                 $paths = array();
@@ -623,8 +632,8 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
                 throw new ReferentialIntegrityException("Cannot delete '".implode("', '", $paths)."': A reference points to this node or a subnode");
             }
 
-            $query = 'DELETE FROM phpcr_nodes_foreignkeys WHERE target_id IN (?)';
-            $this->conn->executeUpdate($query, array($nodeIds), array(Connection::PARAM_INT_ARRAY));
+            $query = 'DELETE FROM phpcr_nodes_references WHERE target_id IN (?)';
+            $this->conn->executeUpdate($query, $params, array(Connection::PARAM_INT_ARRAY));
         }
     }
 
@@ -976,6 +985,7 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
 
         $params = array($path, $path."/%", $this->workspaceName);
 
+        // TODO on RDBMS that support deferred FKs we could skip this step
         $query = 'SELECT id, path FROM phpcr_nodes WHERE (path = ? OR path LIKE ?) AND workspace_name = ?';
         $stmt = $this->conn->executeQuery($query, $params);
         $this->referencesToDelete+= $stmt->fetchAll(\PDO::FETCH_UNIQUE | \PDO::FETCH_COLUMN);
@@ -1017,14 +1027,23 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
                 $found = true;
                 // would be nice to have the property object to ask for type
                 // but its in state deleted, would mean lots of refactoring
-                if ($propertyNode->hasAttribute('sv:type') &&
-                    ('reference' == strtolower($propertyNode->getAttribute('sv:type'))
-                        || 'weakreference' == strtolower($propertyNode->getAttribute('sv:type'))
-                    )
-                ) {
-                    $query = 'DELETE FROM phpcr_nodes_foreignkeys
-                         WHERE source_id = ? AND source_property_name = ?';
-                    $this->conn->executeUpdate($query, array($nodeId, $propertyName));
+                if ($propertyNode->hasAttribute('sv:type')) {
+                    switch (strtolower($propertyNode->getAttribute('sv:type'))) {
+                        case 'reference':
+                            $table = $this->tables[PropertyType::REFERENCE];
+                            break;
+                        case 'weakreference':
+                            $table = $this->tables[PropertyType::WEAKREFERENCE];
+                            break;
+                        default:
+                            $table = false;
+                            break;
+                    }
+
+                    if ($table) {
+                        $query = "DELETE FROM $table WHERE source_id = ? AND source_property_name = ?";
+                        $this->conn->executeUpdate($query, array($nodeId, $propertyName));
+                    }
                 }
                 $propertyNode->parentNode->removeChild($propertyNode);
                 break;
@@ -1686,7 +1705,8 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
 
         if (null !== $offset && null == $limit &&
             ($this->conn->getDatabasePlatform() instanceof MySqlPlatform
-                || $this->conn->getDatabasePlatform() instanceof SqlitePlatform)
+                || $this->conn->getDatabasePlatform() instanceof SqlitePlatform
+            )
         ) {
             $limit = PHP_INT_MAX;
         }
@@ -1835,21 +1855,18 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
     private function getNodeReferences($path, $name = null, $weakReference = false)
     {
         $targetId = $this->pathExists($path);
+        $params = array($targetId);
 
-        $type = $weakReference ? PropertyType::WEAKREFERENCE : PropertyType::REFERENCE;
-
-        $query = "SELECT CONCAT(n.path, '/', fk.source_property_name) as path, fk.source_property_name FROM phpcr_nodes n".
-            '   INNER JOIN phpcr_nodes_foreignkeys fk ON n.id = fk.source_id'.
-            '   WHERE fk.target_id = ? AND fk.type = ?';
-        $properties = $this->conn->fetchAll($query, array($targetId, $type));
-
-        $references = array();
-        foreach ($properties as $property) {
-            if (null === $name || $property['source_property_name'] == $name) {
-                $references[] = $property['path'];
-            }
+        $table = $weakReference ? $this->tables[PropertyType::WEAKREFERENCE] : $this->tables[PropertyType::REFERENCE];
+        $query = "SELECT CONCAT(n.path, '/', r.source_property_name) FROM phpcr_nodes n
+               INNER JOIN $table r ON n.id = r.source_id
+               WHERE r.target_id = ?";
+        if (null !== $name) {
+            $query.= " AND source_property_name = ?";
+            $params[] = $name;
         }
-        return $references;
+        $stmt = $this->conn->executeQuery($query, $params);
+        return $stmt->fetchAll(\PDO::FETCH_COLUMN);
     }
 
     /**
@@ -1930,6 +1947,12 @@ class Client extends BaseTransport implements QueryTransport, WritingInterface, 
     public function prepareSave()
     {
         $this->conn->beginTransaction();
+        $platform = $this->conn->getDatabasePlatform();
+        if ($platform instanceof MySqlPlatform) {
+
+        } elseif ($platform instanceof SqlitePlatform) {
+
+        }
     }
 
     /**
